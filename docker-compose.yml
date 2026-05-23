@@ -1,0 +1,77 @@
+#version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: edu-assistant-backend
+    container_name: backend
+    volumes:
+      - ./backend:/app
+      - static_volume:/app/static
+      - media_volume:/app/media
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    networks:
+      - edu-network
+
+  frontend:
+    build:
+      context: ./frontend  # 确保指向 frontend 目录
+      dockerfile: Dockerfile
+    image: edu-assistant-frontend
+    container_name: frontend
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "8080:80"
+    networks:
+      - edu-network
+    depends_on:
+      - backend
+
+  db:
+    image: postgres:14
+    container_name: db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    networks:
+      - edu-network
+
+  nginx:
+    image: nginx:1.21-alpine
+    container_name: nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/conf.d/:/etc/nginx/conf.d/  # 确保这个路径存在
+      - ./frontend/dist:/usr/share/nginx/html  # ← 新增：把前端打包好的静态文件给根 Nginx
+      - static_volume:/app/static
+      - media_volume:/app/media
+    networks:
+      - edu-network
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  postgres_data:
+  static_volume:
+  media_volume:
+
+networks:
+  edu-network:
+    driver: bridge
