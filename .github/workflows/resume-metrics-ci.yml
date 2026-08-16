@@ -1,0 +1,152 @@
+name: Resume Metrics CI
+
+on:
+  push:
+    branches:
+      - resume-metrics-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  django-metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: edu_assistant
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d edu_assistant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DB_NAME: edu_assistant
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_HOST: localhost
+      DB_PORT: '5432'
+      REDIS_URL: redis://localhost:6379/0
+      SPARK_API_PASSWORD: dummy
+      SPARK_API_KEY: dummy
+      SPARK_APP_ID: dummy
+      SPARK_API_SECRET: dummy
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Prepare container-style paths expected by settings
+        run: |
+          sudo mkdir -p /app/logs /app/static /app/media
+          sudo chmod -R 777 /app
+
+      - name: Django system check
+        id: check
+        continue-on-error: true
+        working-directory: backend
+        run: python manage.py check
+
+      - name: Migration drift check
+        id: migrations
+        continue-on-error: true
+        working-directory: backend
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Run existing Django tests
+        id: tests
+        continue-on-error: true
+        working-directory: backend
+        run: python manage.py test --verbosity 2
+
+      - name: Collect runtime URL and model metrics
+        if: always()
+        working-directory: backend
+        env:
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          MIGRATION_OUTCOME: ${{ steps.migrations.outcome }}
+          TEST_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          python <<'PY'
+          import json, os
+          from pathlib import Path
+          os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+          import django
+          django.setup()
+          from django.apps import apps
+          from django.urls import URLPattern, URLResolver, get_resolver
+
+          routes = []
+          def walk(patterns, prefix=''):
+              for p in patterns:
+                  current = prefix + str(p.pattern)
+                  if isinstance(p, URLPattern):
+                      routes.append({'route': current, 'name': p.name})
+                  elif isinstance(p, URLResolver):
+                      walk(p.url_patterns, current)
+          walk(get_resolver().url_patterns)
+
+          local_apps = [a for a in apps.get_app_configs() if a.name.startswith('apps.')]
+          local_models = []
+          for app in local_apps:
+              for model in app.get_models():
+                  local_models.append(f'{app.label}.{model.__name__}')
+
+          ai_routes = [r for r in routes if r['route'].startswith('api/ai/')]
+          py_test_files = sorted(str(p) for p in Path('.').rglob('test*.py'))
+          metrics = {
+              'djangoCheckOutcome': os.environ.get('CHECK_OUTCOME'),
+              'migrationCheckOutcome': os.environ.get('MIGRATION_OUTCOME'),
+              'djangoTestOutcome': os.environ.get('TEST_OUTCOME'),
+              'activeUrlPatternCount': len(routes),
+              'activeAiRouteCount': len(ai_routes),
+              'activeAiRoutes': ai_routes,
+              'localInstalledAppCount': len(local_apps),
+              'localInstalledApps': [a.name for a in local_apps],
+              'localModelCount': len(local_models),
+              'localModels': local_models,
+              'testFileCount': len(py_test_files),
+              'testFiles': py_test_files,
+          }
+          Path('../resume-metrics.json').write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(metrics, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-metrics
+          path: resume-metrics.json
+          if-no-files-found: warn
+          retention-days: 7
